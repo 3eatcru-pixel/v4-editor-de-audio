@@ -5,72 +5,144 @@ import { WorkspaceService } from "./workspace.service";
 import { MidiSchedulerService } from "./midi/midi-scheduler.service";
 import { PluginHostService } from "./plugins/plugin-host.service";
 
-interface TrackNodes {
-  pannerNode: StereoPannerNode;
-  
-  // 1. Filter
-  filterNode: BiquadFilterNode;
-
-  // Peak EQ
-  eqLowNode: BiquadFilterNode;
-  eqMidNode: BiquadFilterNode;
-  eqHighNode: BiquadFilterNode;
-
-  // 2. Saturation
-  distortionDriveGain: GainNode;
-  distortionNode: WaveShaperNode;
-  distortionWetGain: GainNode;
-  distortionDryGain: GainNode;
-
-  // 3. Chorus
-  chorusDelayNode: DelayNode;
-  chorusLFO: OscillatorNode;
-  chorusLFOGain: GainNode;
-  chorusWetGain: GainNode;
-  chorusDryGain: GainNode;
-
-  // 4. Stereo Tape Delay
-  delayNode: DelayNode;
-  feedbackGainNode: GainNode;
-  delayGainNode: GainNode;
-  delayDryGain: GainNode;
-
-  // 5. Professional Convolution Reverb
-  reverbNode: ConvolverNode;
-  reverbDecay: number;
-  reverbWetGain: GainNode;
-  reverbDryGain: GainNode;
-
-  // 6. Compressor / Limiter
-  compressorNode: DynamicsCompressorNode;
-
-  // Fader output
-  gainNode: GainNode;
-
-  // Dynamic DSP custom inserts loaded by user
-  dynamicPlugins?: {
-    id: string;
-    input: AudioNode;
-    output: AudioNode;
-    update: (now: number) => void;
-  }[];
-}
+// Core Audio sub-engine modules representing the V5 architecture
+import { DSPEngine } from "./audio/dsp-engine";
+import { SampleCache } from "./audio/sample-cache";
+import { MixerEngine } from "./audio/mixer-engine";
+import { TransportEngine } from "./audio/transport-engine";
+import { AudioCoreEngine } from "./audio/audio-core-engine";
+import { OfflineRenderEvent } from "./audio-core/export/offline-renderer";
 
 @Injectable({ providedIn: "root" })
 export class AudioEngineService {
-  private audioCtx: AudioContext | null = null;
+  public audioCtx: AudioContext | null = null;
   private masterGain!: GainNode;
 
-  // Active custom Synth parameter controls
-  synthCutoff = 1500;
-  synthResonance = 2.0;
-  synthAttack = 0.05;
-  synthRelease = 0.4;
-  synthWaveType: OscillatorType = "sawtooth";
-  synthOctave = 0;
+  // Decoupled sub-engine instances representing V5 Modular Architecture
+  public mixerEngine = new MixerEngine();
+  public sampleCache = new SampleCache();
+  public transportEngine!: TransportEngine;
+  
+  // Unified professional pure-TypeScript core engine fader coupling
+  public coreEngine!: AudioCoreEngine;
 
-  customAssetUrlMap = new Map<string, string>();
+  // Active custom Synth parameter controls referenced reactively by the UI controllers
+  public synthCutoff = 1500;
+  public synthResonance = 2.0;
+  public synthAttack = 0.05;
+  public synthRelease = 0.4;
+  public synthWaveType: OscillatorType = "sawtooth";
+  public synthOctave = 0;
 
+  public customAssetUrlMap = new Map<string, string>();
+
+  private platformId = inject(PLATFORM_ID);
+  private projectService = inject(ProjectService);
+  private workspace = inject(WorkspaceService);
+  private midiScheduler = inject(MidiSchedulerService);
+  private pluginHost = inject(PluginHostService);
+
+  // Getter to provide seamless backwards template and timeline bindings compatibility to UI components
+  get trackNodes() {
+    return this.mixerEngine.trackNodes;
+  }
+
+  constructor() {
+    // 1. Conditionally bootstrap layout context
+    this.initContext();
+
+    // 2. Initialize the Transport Clock Engine
+    this.transportEngine = new TransportEngine({
+      getBpm: () => this.projectService.bpm(),
+      getIsPlaying: () => this.projectService.isPlaying(),
+      getPlayhead: () => this.projectService.playheadPosition(),
+      setPlayhead: (pos) => this.projectService.playheadPosition.set(pos),
+      getIsLooping: () => this.projectService.loopEnabled(),
+      getLoopStart: () => this.projectService.loopStart(),
+      getLoopEnd: () => this.projectService.loopEnd(),
+      getAudioContextTime: () => this.audioCtx ? this.audioCtx.currentTime : 0,
+      setCurrentStepSignal: (step) => this.projectService.currentStep.set(step),
+      onScheduleNote: (stepIndex, preciseTime) => this.scheduleNote(stepIndex, preciseTime)
+    });
+
+    // 3. Setup the unified, framework-agnostic pure-TypeScript AudioCoreEngine
+    this.coreEngine = new AudioCoreEngine({
+      getBpm: () => this.projectService.bpm(),
+      getIsLooping: () => this.projectService.loopEnabled(),
+      getLoopStart: () => this.projectService.loopStart(),
+      getLoopEnd: () => this.projectService.loopEnd(),
+      triggerSynthNote: (midiNote, velocity, time, duration) => {
+        const outNodes = this.mixerEngine.trackNodes.get("t3"); // Keys/Synth track routing
+        this.playSynth(
+          time,
+          440 * Math.pow(2, (midiNote - 69) / 12),
+          duration,
+          this.synthWaveType,
+          outNodes ? outNodes.pannerNode : (this.masterGain || this.audioCtx?.destination)
+        );
+      },
+      triggerDrumNote: (padId, velocity, time) => {
+        const drumNames = ["kick", "snare", "hihat", "open hat", "crash", "tom", "clap", "rim"];
+        const label = drumNames[(padId - 1) % 8];
+        console.debug(`Triggering pad ${padId} (velocity: ${velocity}, time: ${time})`);
+        this.playOneShot(label, undefined, { start: 0, end: 1 });
+      },
+      onPlayheadChange: (playhead) => {
+        this.projectService.playheadPosition.set(playhead);
+        const current16th = Math.floor(playhead * 4);
+        this.projectService.currentStep.set(current16th % 16);
+      }
+    });
+
+    // Mirror variables onto our core model
+    this.coreEngine.audioCtx = this.audioCtx;
+    this.coreEngine.getActiveNotes = () => this.workspace.pianoNotes().map(n => {
+      // adapt layout note structure to absolute MIDI indexed patterns coordinates
+      const stepIndex = Math.round(n.x / 32);
+      const keys = ["C4", "B3", "A#3", "A3", "G#3", "G3", "F#3", "F3", "E3", "D#3", "D3", "C#3", "C3"];
+      const keysLength = keys.length;
+      const keyIndex = Math.round(n.y / 24) % keysLength;
+      const noteName = keys[keyIndex] || "C4";
+      const startTick = stepIndex * 240; // 1/16th notes PPQ intervals
+      return {
+        id: n.id,
+        note: DSPEngine.noteToMidi(noteName),
+        startTick: startTick,
+        lengthTick: 240,
+        velocity: 100,
+        channel: 1, // Synth channel
+      };
+    });
+
+    // React to playhead isPlaying state toggles automatically
+    effect(() => {
+      const isPlaying = this.projectService.isPlaying();
+      if (isPlaying) {
+        if (this.audioCtx && this.audioCtx.state === "suspended") {
+          this.audioCtx.resume();
+        }
+        this.transportEngine.start();
+        this.coreEngine.initAudioContext();
+        this.coreEngine.transport.play();
+      } else {
+        this.transportEngine.pause();
+        this.coreEngine.transport.pause();
+      }
+    });
+
+    // React to track volume, panning, mute, solo, and dynamic plug settings changes
+    effect(() => {
+      const tracks = this.projectService.tracks();
+      this.pluginHost.trackFxChains(); // direct signal read to trigger Angular reactive track dependency
+      if (this.audioCtx) {
+        this.updateRouting(tracks);
+      }
+    });
+  }
+
+  /**
+   * Safe updates to user modular synthesis sound shaping bounds.
+   */
   updateSynthParams(params: {
     cutoff?: number;
     resonance?: number;
@@ -85,76 +157,16 @@ export class AudioEngineService {
     if (params.release !== undefined) this.synthRelease = params.release;
     if (params.waveType !== undefined) this.synthWaveType = params.waveType;
     if (params.octave !== undefined) this.synthOctave = params.octave;
-  }
 
-  private clockWorker: Worker | null = null;
-  private lastTime = 0;
-  private trackNodes = new Map<string, TrackNodes>();
-  private sampleCache = new Map<string, AudioBuffer>();
-  private isLoading = new Map<string, boolean>();
-  private nextEventTime = 0;
-  private currentEighthNote = 0;
-  private lastSetPlayhead = 0;
-
-  private platformId = inject(PLATFORM_ID);
-  private projectService = inject(ProjectService);
-  private workspace = inject(WorkspaceService);
-  private midiScheduler = inject(MidiSchedulerService);
-  private pluginHost = inject(PluginHostService);
-
-  constructor() {
-    effect(() => {
-      const isPlaying = this.projectService.isPlaying();
-      if (isPlaying) {
-        this.start();
-      } else {
-        this.pause();
-      }
-    });
-
-    // React to track volume/mute/plugin changes
-    effect(() => {
-      const tracks = this.projectService.tracks();
-      this.pluginHost.trackFxChains(); // read the signal directly to register dependency tracking reactively
-      if (this.audioCtx) {
-        this.updateRouting(tracks);
-      }
-    });
-  }
-
-  private makeDistortionCurve(amount: number): Float32Array {
-    const k = amount;
-    const n_samples = 44100;
-    const curve = new Float32Array(n_samples);
-    const deg = Math.PI / 180;
-    for (let i = 0; i < n_samples; ++i) {
-      const x = (i * 2) / n_samples - 1;
-      // Formula for soft-clipping tube distortion curve
-      curve[i] = ((3 + k) * x * 20 * deg) / (Math.PI + k * Math.abs(x));
+    // Reactively notify our transport lookahead engine of parameter edits to prevent note scheduling lags
+    if (this.transportEngine) {
+      this.transportEngine.forceSync();
     }
-    return curve;
   }
 
-  private createReverbImpulseResponse(decay: number): AudioBuffer {
-    const rate = this.audioCtx ? this.audioCtx.sampleRate : 44100;
-    const length = rate * Math.max(0.1, decay);
-    const impulse = this.audioCtx 
-      ? this.audioCtx.createBuffer(2, length, rate) 
-      : { getChannelData: () => new Float32Array(length) } as unknown as AudioBuffer;
-    
-    const left = impulse.getChannelData(0);
-    const right = impulse.getChannelData(1);
-
-    for (let i = 0; i < length; i++) {
-      const percent = i / length;
-      // Exponential envelope decay representing studio room absorption kinetics
-      const decayFactor = Math.exp(-9 * percent);
-      left[i] = (Math.random() * 2 - 1) * decayFactor * 0.5;
-      right[i] = (Math.random() * 2 - 1) * decayFactor * 0.5;
-    }
-    return impulse;
-  }
-
+  /**
+   * Initializes the browser AudioContext system.
+   */
   private initContext() {
     if (!this.audioCtx && isPlatformBrowser(this.platformId)) {
       try {
@@ -164,439 +176,52 @@ export class AudioEngineService {
           this.audioCtx = new AudioCtx();
           this.masterGain = this.audioCtx.createGain();
           this.masterGain.connect(this.audioCtx.destination);
-          this.masterGain.gain.value = 0.5; // Master volume
+          this.masterGain.gain.value = 0.5; // Default master sum limit
         }
       } catch (e) {
-        console.warn("AudioContext initialization failed", e);
+        console.warn("AudioContext bootstrap sequence failed inside context-init:", e);
       }
     }
   }
 
+  /**
+   * Synchronizes mixer stripes and parameters across changes.
+   */
   private updateRouting(tracks: Track[]) {
     if (!this.audioCtx) return;
 
-    // Remove deleted tracks and clean up LFO oscillators
-    for (const [id, nodes] of this.trackNodes.entries()) {
+    // Clean up tracks deleted from project models
+    for (const [id] of this.mixerEngine.trackNodes.entries()) {
       if (!tracks.find((t) => t.id === id)) {
-        try {
-          if (nodes.chorusLFO) {
-            nodes.chorusLFO.disconnect();
-            nodes.chorusLFO.stop();
-          }
-        } catch {
-          // ignore stopped oscillator errors
-        }
-        nodes.gainNode.disconnect();
-        this.trackNodes.delete(id);
+        this.mixerEngine.removeTrack(id);
       }
     }
 
     const anySolo = tracks.some((t) => t.solo);
 
     for (const track of tracks) {
-      let nodes = this.trackNodes.get(track.id);
-      if (!nodes) {
-        // --- 1. Instantiate DSP Audio Nodes ---
-        const pannerNode = this.audioCtx.createStereoPanner();
+      // Ensure web audio nodes exist and connect to master gain fader
+      this.mixerEngine.ensureTrackNodes(this.audioCtx, this.masterGain, track.id, track);
 
-        // Stage 1 Filter node
-        const filterNode = this.audioCtx.createBiquadFilter();
-        filterNode.type = track.filterType || "lowpass";
-        filterNode.frequency.value = track.filterCutoff !== undefined ? track.filterCutoff : 20000;
-        filterNode.Q.value = track.filterReso !== undefined ? track.filterReso : 1.0;
+      // Setup dynamic FX plugins chains cascading
+      const list = this.pluginHost.trackFxChains().get(track.id)?.plugins || [];
+      this.mixerEngine.rebuildDynamicPluginsChain(this.audioCtx, track.id, list, this.pluginHost);
 
-        // Vintage parametric EQ Shelf and Peak filters
-        const eqLowNode = this.audioCtx.createBiquadFilter();
-        eqLowNode.type = "lowshelf";
-        eqLowNode.frequency.value = 320;
-
-        const eqMidNode = this.audioCtx.createBiquadFilter();
-        eqMidNode.type = "peaking";
-        eqMidNode.frequency.value = 1000;
-        eqMidNode.Q.value = 1.0;
-
-        const eqHighNode = this.audioCtx.createBiquadFilter();
-        eqHighNode.type = "highshelf";
-        eqHighNode.frequency.value = 3200;
-
-        // Stage 2: Vintage Tube Saturator
-        const distortionDriveGain = this.audioCtx.createGain();
-        const distortionNode = this.audioCtx.createWaveShaper();
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        distortionNode.curve = this.makeDistortionCurve(track.distortionDrive || 0) as any;
-        distortionNode.oversample = "4x";
-        const distortionWetGain = this.audioCtx.createGain();
-        const distortionDryGain = this.audioCtx.createGain();
-        const chorusInputGain = this.audioCtx.createGain();
-
-        // Stage 3: Analog Chorus/Flanger
-        const chorusDelayNode = this.audioCtx.createDelay(0.1);
-        chorusDelayNode.delayTime.value = 0.02; // 20ms base delay
-        const chorusLFO = this.audioCtx.createOscillator();
-        chorusLFO.type = "sine";
-        chorusLFO.frequency.value = track.chorusRate !== undefined ? track.chorusRate : 1.0;
-        const chorusLFOGain = this.audioCtx.createGain();
-        chorusLFOGain.gain.value = (track.chorusDepth !== undefined ? track.chorusDepth : 0) * 0.004;
-        const chorusWetGain = this.audioCtx.createGain();
-        const chorusDryGain = this.audioCtx.createGain();
-        const delayInputGain = this.audioCtx.createGain();
-
-        // Stage 4: Tape Delay
-        const delayNode = this.audioCtx.createDelay(2.0);
-        delayNode.delayTime.value = track.delayTime !== undefined ? track.delayTime : 0.25;
-        const feedbackGainNode = this.audioCtx.createGain();
-        feedbackGainNode.gain.value = track.delayFeedback !== undefined ? track.delayFeedback : 0.35;
-        const delayGainNode = this.audioCtx.createGain();
-        const delayDryGain = this.audioCtx.createGain();
-        const reverbInputGain = this.audioCtx.createGain();
-
-        // Stage 5: Pro Studio Reverb (Convolution)
-        const reverbNode = this.audioCtx.createConvolver();
-        const reverbDecayValue = track.reverbDecay !== undefined ? track.reverbDecay : 2.0;
-        reverbNode.buffer = this.createReverbImpulseResponse(reverbDecayValue);
-        const reverbWetGain = this.audioCtx.createGain();
-        const reverbDryGain = this.audioCtx.createGain();
-        const compressorInputGain = this.audioCtx.createGain();
-
-        // Stage 6: Studio Mastering Compressor/Limiter
-        const compressorNode = this.audioCtx.createDynamicsCompressor();
-
-        // Final Mix Track Fader
-        const gainNode = this.audioCtx.createGain();
-
-        // --- 2. Interconnect DSP Graph in Series/Parallel Nodes ---
-        // Input -> Panner -> state-variable filter -> Parametric High/Mid/Low EQ rack
-        pannerNode.connect(filterNode);
-        filterNode.connect(eqLowNode);
-        eqLowNode.connect(eqMidNode);
-        eqMidNode.connect(eqHighNode);
-
-        // Saturation Tube section split
-        eqHighNode.connect(distortionDriveGain);
-        distortionDriveGain.connect(distortionNode);
-        distortionNode.connect(distortionWetGain);
-        eqHighNode.connect(distortionDryGain);
-        
-        // Saturation merger
-        distortionWetGain.connect(chorusInputGain);
-        distortionDryGain.connect(chorusInputGain);
-
-        // Chorus modulation section split
-        chorusInputGain.connect(chorusDelayNode);
-        chorusDelayNode.connect(chorusWetGain);
-        chorusInputGain.connect(chorusDryGain);
-
-        // LFO Pitch Shimmer wiring
-        chorusLFO.connect(chorusLFOGain);
-        chorusLFOGain.connect(chorusDelayNode.delayTime);
-        chorusLFO.start(0);
-
-        // Chorus merger
-        chorusWetGain.connect(delayInputGain);
-        chorusDryGain.connect(delayInputGain);
-
-        // Delay echo feedback circuit split
-        delayInputGain.connect(delayNode);
-        delayNode.connect(feedbackGainNode);
-        feedbackGainNode.connect(delayNode); // feedback routing
-
-        delayNode.connect(delayGainNode);
-        delayInputGain.connect(delayDryGain);
-
-        // Delay merger
-        delayGainNode.connect(reverbInputGain);
-        delayDryGain.connect(reverbInputGain);
-
-        // Convolution Reverb section split
-        reverbInputGain.connect(reverbNode);
-        reverbNode.connect(reverbWetGain);
-        reverbInputGain.connect(reverbDryGain);
-
-        // Reverb merger
-        reverbWetGain.connect(compressorInputGain);
-        reverbDryGain.connect(compressorInputGain);
-
-        // Compressor -> Master sum
-        compressorInputGain.connect(compressorNode);
-        compressorNode.connect(gainNode);
-        gainNode.connect(this.masterGain);
-
-        nodes = {
-          pannerNode,
-          filterNode,
-          eqLowNode,
-          eqMidNode,
-          eqHighNode,
-          distortionDriveGain,
-          distortionNode,
-          distortionWetGain,
-          distortionDryGain,
-          chorusDelayNode,
-          chorusLFO,
-          chorusLFOGain,
-          chorusWetGain,
-          chorusDryGain,
-          delayNode,
-          feedbackGainNode,
-          delayGainNode,
-          delayDryGain,
-          reverbNode,
-          reverbDecay: reverbDecayValue,
-          reverbWetGain,
-          reverbDryGain,
-          compressorNode,
-          gainNode
-        };
-        this.trackNodes.set(track.id, nodes);
-      }
-
-      this.rebuildDynamicPluginsChain(track, nodes);
-
-      const nowTime = this.audioCtx.currentTime;
-
-      // --- 3. Run Real-time Parameter Interpolations ---
-      // Filter updates
-      const fType = track.filterType || "lowpass";
-      if (nodes.filterNode.type !== fType) {
-        nodes.filterNode.type = fType;
-      }
-      const cutoffVal = track.filterCutoff !== undefined ? track.filterCutoff : 20000;
-      nodes.filterNode.frequency.setTargetAtTime(cutoffVal, nowTime, 0.05);
-      const resoVal = track.filterReso !== undefined ? track.filterReso : 1.0;
-      nodes.filterNode.Q.setTargetAtTime(resoVal, nowTime, 0.05);
-
-      // Vintage EQs
-      nodes.eqLowNode.gain.setTargetAtTime(track.eqLow || 0, nowTime, 0.05);
-      nodes.eqMidNode.gain.setTargetAtTime(track.eqMid || 0, nowTime, 0.05);
-      nodes.eqHighNode.gain.setTargetAtTime(track.eqHigh || 0, nowTime, 0.05);
-
-      // Tube Saturator (Drive & Wet/Dry Mix)
-      const driveVal = track.distortionDrive !== undefined ? track.distortionDrive : 0;
-      const distMixVal = track.distortionMix !== undefined ? track.distortionMix : 0;
-      nodes.distortionDriveGain.gain.setTargetAtTime(1.0 + driveVal * 0.15, nowTime, 0.05);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      nodes.distortionNode.curve = this.makeDistortionCurve(driveVal) as any;
-      nodes.distortionWetGain.gain.setTargetAtTime(distMixVal, nowTime, 0.05);
-      nodes.distortionDryGain.gain.setTargetAtTime(1.0 - distMixVal, nowTime, 0.05);
-
-      // Chorus (Rate, Depth, and Wet/Dry Mix)
-      const chorusRateVal = track.chorusRate !== undefined ? track.chorusRate : 1.0;
-      const chorusDepthVal = track.chorusDepth !== undefined ? track.chorusDepth : 0;
-      const chorusMixVal = track.chorusMix !== undefined ? track.chorusMix : 0;
-      nodes.chorusLFO.frequency.setTargetAtTime(chorusRateVal, nowTime, 0.05);
-      nodes.chorusLFOGain.gain.setTargetAtTime(chorusDepthVal * 0.004, nowTime, 0.05);
-      nodes.chorusWetGain.gain.setTargetAtTime(chorusMixVal, nowTime, 0.05);
-      nodes.chorusDryGain.gain.setTargetAtTime(1.0 - chorusMixVal, nowTime, 0.05);
-
-      // Tape Echo Delay (Delay Time, Feedback, and Mix)
-      const delayTimeVal = track.delayTime !== undefined ? track.delayTime : 0.25;
-      const delayFbackVal = track.delayFeedback !== undefined ? track.delayFeedback : 0.35;
-      const delayMixVal = track.delayMix !== undefined ? track.delayMix : 0;
-      nodes.delayNode.delayTime.setTargetAtTime(delayTimeVal, nowTime, 0.05);
-      nodes.feedbackGainNode.gain.setTargetAtTime(Math.min(0.95, delayFbackVal), nowTime, 0.05);
-      nodes.delayGainNode.gain.setTargetAtTime(delayMixVal, nowTime, 0.05);
-      nodes.delayDryGain.gain.setTargetAtTime(1.0 - delayMixVal, nowTime, 0.05);
-
-      // Pro Studio Convolution Reverb
-      const reverbDecayVal = track.reverbDecay !== undefined ? track.reverbDecay : 2.0;
-      const reverbMixVal = track.reverbMix !== undefined ? track.reverbMix : 0;
-      if (nodes.reverbDecay !== reverbDecayVal) {
-        nodes.reverbDecay = reverbDecayVal;
-        try {
-          nodes.reverbNode.buffer = this.createReverbImpulseResponse(reverbDecayVal);
-        } catch (e) {
-          console.warn("Unable to generate/apply convolver reverb buffer", e);
-        }
-      }
-      nodes.reverbWetGain.gain.setTargetAtTime(reverbMixVal, nowTime, 0.05);
-      nodes.reverbDryGain.gain.setTargetAtTime(1.0 - reverbMixVal, nowTime, 0.05);
-
-      // Compressor Threshold & Ratio
-      nodes.compressorNode.threshold.setTargetAtTime(track.compThreshold !== undefined ? track.compThreshold : -18, nowTime, 0.05);
-      nodes.compressorNode.ratio.setTargetAtTime(track.compRatio !== undefined ? track.compRatio : 4, nowTime, 0.05);
-
-      // Interpolate user loaded dynamic custom DSP modules
-      if (nodes.dynamicPlugins) {
-        for (const dp of nodes.dynamicPlugins) {
-          try {
-            dp.update(nowTime);
-          } catch (e) {
-            console.warn("Plugin dynamic parameter update failed:", e);
-          }
-        }
-      }
-
-      // Main Mixer Volume & Channel Panning
-      const isMuted = track.mute || (anySolo && !track.solo);
-      nodes.gainNode.gain.setTargetAtTime(
-        isMuted ? 0 : track.volume,
-        this.audioCtx.currentTime,
-        0.05,
-      );
-      nodes.pannerNode.pan.setTargetAtTime(
-        track.pan || 0,
-        this.audioCtx.currentTime,
-        0.05,
-      );
+      // Dynamically interpolate parameters (panning, filter sweeps, volume EQs)
+      this.mixerEngine.updateTrackParameters(this.audioCtx, track.id, track, anySolo);
     }
   }
 
-  private rebuildDynamicPluginsChain(track: Track, nodes: TrackNodes) {
-    if (!this.audioCtx) return;
-    const list = this.pluginHost.trackFxChains().get(track.id)?.plugins || [];
-    const currentList = nodes.dynamicPlugins || [];
-
-    // Compare signature (including bypass states) to see if chain structure has evolved
-    const listSignature = list.map(p => p.id + "_" + p.bypass).join(",");
-    const currentSignature = currentList.map(p => p.id + "_" + (p.output ? "active" : "bypassed")).join(",");
-
-    if (listSignature !== currentSignature || !nodes.dynamicPlugins) {
-      // 1. Terminate compressorNode and other dynamic outputs connections safe cycle
-      try {
-        nodes.compressorNode.disconnect();
-      } catch { /* ignore */ }
-
-      if (nodes.dynamicPlugins) {
-        for (const p of nodes.dynamicPlugins) {
-          try {
-            p.output.disconnect();
-          } catch { /* ignore */ }
-        }
-      }
-
-      // 2. Wire up the cascading pipeline
-      const newDps: { id: string; input: AudioNode; output: AudioNode; update: (now: number) => void }[] = [];
-      let lastNode: AudioNode = nodes.compressorNode;
-
-      for (const p of list) {
-        const graph = this.pluginHost.createAudioGraphForPlugin(this.audioCtx, p, track.id);
-        
-        // Connect previous stage output to current plugin input
-        lastNode.connect(graph.input);
-        lastNode = graph.output;
-
-        newDps.push({
-          id: p.id,
-          input: graph.input,
-          output: graph.output,
-          update: graph.update
-        });
-      }
-
-      // 3. Connect final element to output gain node
-      lastNode.connect(nodes.gainNode);
-      nodes.dynamicPlugins = newDps;
-    }
-  }
-
-  private start() {
-    this.initContext();
-    if (this.audioCtx && this.audioCtx.state === "suspended") {
-      this.audioCtx.resume();
-    }
-
-    if (!this.audioCtx) return; // if initContext failed (e.g. SSR)
-
-    const playheadBeats = this.projectService.playheadPosition();
-    this.currentEighthNote = Math.floor(playheadBeats * 4);
-    this.lastSetPlayhead = playheadBeats;
-    // Restart lookahead slightly ahead of context
-    this.nextEventTime = this.audioCtx.currentTime + 0.1;
-
-    this.lastTime =
-      typeof performance !== "undefined" ? performance.now() : Date.now();
-
-    if (!this.clockWorker) {
-      const code = `
-        let timer = null;
-        self.onmessage = (e) => {
-          if (e.data === 'start') {
-            if (!timer) timer = setInterval(() => self.postMessage('tick'), 16);
-          } else if (e.data === 'stop') {
-            clearInterval(timer);
-            timer = null;
-          }
-        };
-      `;
-      const blob = new Blob([code], { type: 'application/javascript' });
-      this.clockWorker = new Worker(URL.createObjectURL(blob));
-      this.clockWorker.onmessage = () => {
-        this.tick(typeof performance !== "undefined" ? performance.now() : Date.now());
-      };
-    }
-    
-    this.clockWorker.postMessage('start');
-    this.tick(this.lastTime);
-  }
-
-  private pause() {
-    if (this.clockWorker) {
-      this.clockWorker.postMessage('stop');
-    }
-  }
-
-  private tick(now: number) {
-    if (!this.audioCtx || !this.projectService.isPlaying()) return;
-
-    const deltaMs = now - this.lastTime;
-    this.lastTime = now;
-
-    const bpm = this.projectService.bpm();
-    const beatsPerSecond = bpm / 60;
-    const deltaBeats = (deltaMs / 1000) * beatsPerSecond;
-
-    // Detect external seek
-    const currentPos = this.projectService.playheadPosition();
-    const expectedPos = this.lastSetPlayhead;
-    if (Math.abs(currentPos - expectedPos) > 0.05) {
-      // User seeked the playhead from the UI
-      this.currentEighthNote = Math.floor(currentPos * 4);
-      this.nextEventTime = this.audioCtx.currentTime + 0.1;
-    }
-
-    // Update playhead
-    let nextPos = currentPos + deltaBeats;
-    const isLooping = this.projectService.loopEnabled();
-    const loopStartValue = this.projectService.loopStart();
-    const loopEndValue = this.projectService.loopEnd();
-
-    if (isLooping && nextPos >= loopEndValue) {
-      nextPos = loopStartValue + (nextPos % Math.max(0.1, loopEndValue - loopStartValue));
-      this.currentEighthNote = Math.floor(nextPos * 4);
-    }
-    this.projectService.playheadPosition.set(nextPos);
-    this.lastSetPlayhead = nextPos;
-
-    // Schedule audio
-    const secondsPerBeat = 60.0 / bpm;
-    // Lookahead approach for scheduling
-    while (this.nextEventTime < this.audioCtx.currentTime + 0.1) {
-      this.scheduleNote(this.currentEighthNote, this.nextEventTime);
-
-      // Update UI step
-      const stepIndex = this.currentEighthNote % 16;
-      this.projectService.currentStep.set(stepIndex);
-
-      this.nextEventTime += 0.25 * secondsPerBeat; // Sixteenth note step instead of eighth
-      this.currentEighthNote++;
-      
-      if (isLooping) {
-        const loopEnd16ths = Math.floor(loopEndValue * 4);
-        const loopStart16ths = Math.floor(loopStartValue * 4);
-        if (this.currentEighthNote >= loopEnd16ths) {
-           this.currentEighthNote = loopStart16ths;
-        }
-      }
-    }
-  }
-
+  /**
+   * Direct trigger to play a specific instrument or pitch instantly (Keyboard live taps or browser sample lists).
+   */
   playOneShot(
     instrument: string,
     url?: string,
     options?: { pitch?: number; start?: number; end?: number; fade?: number }
   ) {
     if (!this.audioCtx) this.initContext();
-    if (!this.audioCtx) return; // Init failed
+    if (!this.audioCtx) return;
     if (this.audioCtx.state === "suspended") this.audioCtx.resume();
 
     const time = this.audioCtx.currentTime;
@@ -605,6 +230,7 @@ export class AudioEngineService {
     const name = instrument.toLowerCase();
     const isNote = /^[A-G]#?[0-9]$/i.test(instrument);
 
+    // Track bussing / routing logic mapping naming to dedicated channels
     let targetTrackId = "";
     if (["kick", "snare", "hihat", "clap", "crash", "rim", "perc 1", "perc 2", "open hat", "shaker"].some(t => name.includes(t))) {
       targetTrackId = "t1"; // Drums
@@ -619,7 +245,7 @@ export class AudioEngineService {
     }
 
     if (targetTrackId) {
-      const nodes = this.trackNodes.get(targetTrackId);
+      const nodes = this.mixerEngine.trackNodes.get(targetTrackId);
       if (nodes) {
         out = nodes.pannerNode;
       }
@@ -631,53 +257,28 @@ export class AudioEngineService {
     }
 
     if (isNote) {
-      const midi = this.noteToMidi(instrument);
-      const SALAMANDER_NOTES = [
-        { name: "A0", midi: 21 }, { name: "C1", midi: 24 }, { name: "D#1", midi: 27 }, { name: "F#1", midi: 30 },
-        { name: "A1", midi: 33 }, { name: "C2", midi: 36 }, { name: "D#2", midi: 39 }, { name: "F#2", midi: 42 },
-        { name: "A2", midi: 45 }, { name: "C3", midi: 48 }, { name: "D#3", midi: 51 }, { name: "F#3", midi: 54 },
-        { name: "A3", midi: 57 }, { name: "C4", midi: 60 }, { name: "D#4", midi: 63 }, { name: "F#4", midi: 66 },
-        { name: "A4", midi: 69 }, { name: "C5", midi: 72 }, { name: "D#5", midi: 75 }, { name: "F#5", midi: 78 },
-        { name: "A5", midi: 81 }, { name: "C6", midi: 84 }, { name: "D#6", midi: 87 }, { name: "F#6", midi: 90 },
-        { name: "A6", midi: 93 }, { name: "C7", midi: 96 }, { name: "D#7", midi: 99 }, { name: "F#7", midi: 102 },
-        { name: "A7", midi: 105 }, { name: "C8", midi: 108 }
-      ];
-      
-      let closest = SALAMANDER_NOTES[0];
-      let minDiff = Math.abs(midi - closest.midi);
-      for (let i = 1; i < SALAMANDER_NOTES.length; i++) {
-        const diff = Math.abs(midi - SALAMANDER_NOTES[i].midi);
-        if (diff < minDiff) {
-          minDiff = diff;
-          closest = SALAMANDER_NOTES[i];
-        }
+      const noteSettings = DSPEngine.getSalamanderNoteSettings(instrument);
+      if (noteSettings) {
+        this.playUrl(noteSettings.noteUrl, out, time, { ...options, pitch: noteSettings.pitchOffset });
       }
-      
-      const noteUrl = `https://tonejs.github.io/audio/salamander/${encodeURIComponent(closest.name)}.mp3`;
-      const semitoneDiff = midi - closest.midi;
-      const pitchOctaves = semitoneDiff / 12;
-      
-      this.playUrl(noteUrl, out, time, { ...options, pitch: pitchOctaves });
       return;
     }
 
     const lowerName = instrument.toLowerCase();
 
+    // Drum synthetically synthesized sound models fallback
     if (lowerName.includes("kick") || lowerName.includes("kck")) {
       this.playKick(time, out);
       return;
     }
-
     if (lowerName.includes("snare") || lowerName.includes("snr") || lowerName.includes("rim")) {
       this.playSnare(time, out);
       return;
     }
-
     if (lowerName.includes("clap") || lowerName.includes("clp")) {
       this.playClap(time, out);
       return;
     }
-
     if (
       lowerName.includes("hihat") ||
       lowerName.includes("hat") ||
@@ -692,63 +293,37 @@ export class AudioEngineService {
       return;
     }
 
+    // Instrument Synthesizer sound generation
     if (lowerName.includes("bass") || lowerName.includes("bas")) {
       const type: OscillatorType = lowerName.includes("acid") || lowerName.includes("psy") ? "sawtooth" : "sine";
-      const freq = lowerName.includes("sub") ? 32.7 : 55.0; // low C1 or A1
+      const freq = lowerName.includes("sub") ? 32.7 : 55.0; // Low C1 or A1 frequency
       this.playSynth(time, freq, 0.4, type, out);
       return;
     }
-
-    if (
-      lowerName.includes("chord") ||
-      lowerName.includes("chd") ||
-      lowerName.includes("rhodes") ||
-      lowerName.includes("epiano")
-    ) {
-      this.playSynth(time, 261.63, 0.2, "triangle", out); // C4
+    if (lowerName.includes("chord") || lowerName.includes("chd") || lowerName.includes("rhodes") || lowerName.includes("epiano")) {
+      this.playSynth(time, 261.63, 0.2, "triangle", out); // C4 Chord fundamental
       this.playSynth(time, 311.13, 0.2, "triangle", out); // D#4
       this.playSynth(time, 392.00, 0.2, "triangle", out); // G4
       return;
     }
-
-    if (
-      lowerName.includes("synth") ||
-      lowerName.includes("stb") ||
-      lowerName.includes("beep") ||
-      lowerName.includes("slinky")
-    ) {
+    if (lowerName.includes("synth") || lowerName.includes("stb") || lowerName.includes("beep") || lowerName.includes("slinky")) {
       const type: OscillatorType = lowerName.includes("rave") || lowerName.includes("square") ? "square" : "triangle";
       this.playSynth(time, 220, 0.3, type, out);
       return;
     }
-
     if (lowerName.includes("lead") || lowerName.includes("scream") || lowerName.includes("fl")) {
-      this.playSynth(time, 659.25, 0.3, "sawtooth", out); // E5
+      this.playSynth(time, 659.25, 0.3, "sawtooth", out); // E5 lead pluck
       return;
     }
-
-    if (
-      lowerName.includes("pad") ||
-      lowerName.includes("swell") ||
-      lowerName.includes("shree") ||
-      lowerName.includes("wave") ||
-      lowerName.includes("wv")
-    ) {
-      this.playSynth(time, 196.00, 0.5, "sine", out); // G3
+    if (lowerName.includes("pad") || lowerName.includes("swell") || lowerName.includes("shree") || lowerName.includes("wave") || lowerName.includes("wv")) {
+      this.playSynth(time, 196.00, 0.5, "sine", out);
       return;
     }
-
     if (lowerName.includes("bell") || lowerName.includes("chime") || lowerName.includes("whistle")) {
-      this.playSynth(time, 880, 0.2, "sine", out); // High pitch
+      this.playSynth(time, 880, 0.2, "sine", out);
       return;
     }
-
-    if (
-      lowerName.includes("metronome") ||
-      lowerName.includes("clk") ||
-      lowerName.includes("click") ||
-      lowerName.includes("wood")
-    ) {
+    if (lowerName.includes("metronome") || lowerName.includes("clk") || lowerName.includes("click") || lowerName.includes("wood")) {
       const osc = this.audioCtx.createOscillator();
       const gain = this.audioCtx.createGain();
       osc.type = "sine";
@@ -761,7 +336,6 @@ export class AudioEngineService {
       osc.stop(time + 0.06);
       return;
     }
-
     if (
       lowerName.includes("drop") ||
       lowerName.includes("impact") ||
@@ -785,7 +359,6 @@ export class AudioEngineService {
       osc.stop(time + 0.6);
       return;
     }
-
     if (lowerName.includes("vocal") || lowerName.includes("shout") || lowerName.includes("ah")) {
       this.playSynth(time, 300, 0.25, "sine", out);
       return;
@@ -794,109 +367,36 @@ export class AudioEngineService {
     this.playSynth(time, 440, 0.1, "sine", out);
   }
 
-  noteToFreq(note: string): number {
-    const notesMap: Record<string, number> = {
-      "C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5, "F#": 6, "G": 7, "G#": 8, "A": 9, "A#": 10, "B": 11
-    };
-    const match = note.match(/^([A-G]#?)([0-9])$/i);
-    if (!match) return 440;
-    const name = match[1].toUpperCase();
-    const octave = parseInt(match[2], 10);
-    const offset = notesMap[name] ?? 0;
-    const midi = (octave + 1) * 12 + offset;
-    return 440 * Math.pow(2, (midi - 69) / 12);
-  }
-
-  noteToMidi(note: string): number {
-    const notesMap: Record<string, number> = {
-      "C": 0, "C#": 1, "D": 2, "D#": 3, "E": 4, "F": 5, "F#": 6, "G": 7, "G#": 8, "A": 9, "A#": 10, "B": 11
-    };
-    const match = note.match(/^([A-G]#?)([0-9])$/i);
-    if (!match) return 60;
-    const name = match[1].toUpperCase();
-    const octave = parseInt(match[2], 10);
-    const offset = notesMap[name] ?? 0;
-    return (octave + 1) * 12 + offset;
-  }
-
+  /**
+   * Facade getter for pre-fetching or offline decodings of asset library clips.
+   */
   getAudioBuffer(originalUrl: string): Promise<AudioBuffer | null> {
-    const url = this.cleanAudioUrl(originalUrl);
-    if (!this.audioCtx) this.initContext();
-    if (!this.audioCtx) return Promise.resolve(null);
-    if (this.sampleCache.has(url)) {
-      return Promise.resolve(this.sampleCache.get(url)!);
-    }
-
-    return fetch(url)
-      .then((res) => {
-        if (!res.ok) throw new Error(`HTTP status ${res.status}`);
-        return res.arrayBuffer();
-      })
-      .then((data) => this.audioCtx!.decodeAudioData(data))
-      .then((decodedBuf) => {
-        this.sampleCache.set(url, decodedBuf);
-        return decodedBuf;
-      })
-      .catch((err) => {
-        console.error("Failed to load sample config", url, err);
-        return null;
-      });
+    return this.sampleCache.getAudioBuffer(this.audioCtx, originalUrl);
   }
 
-  private cleanAudioUrl(url: string): string {
-    if (url.includes("salamander")) {
-      const parts = url.split("/");
-      const lastPart = parts[parts.length - 1];
-      if (lastPart.includes("#") || lastPart.includes("%23")) {
-        const replaced = lastPart.replace(/#|%23/g, "s");
-        parts[parts.length - 1] = replaced;
-        return parts.join("/");
-      }
-    }
-    return url;
+  /**
+   * Facade lookups for Note to Frequency Hz values.
+   */
+  noteToFreq(note: string): number {
+    return DSPEngine.noteToFreq(note);
   }
 
-  private playUrl(originalUrl: string, out: AudioNode, time: number, options?: { pitch?: number; start?: number; end?: number; fade?: number; startSeconds?: number; durationSeconds?: number; playbackRate?: number }) {
-    if (!this.audioCtx) return;
-    const url = this.cleanAudioUrl(originalUrl);
-    const buffer = this.sampleCache.get(url);
-    if (buffer) {
-      this.playBuffer(buffer, out, time, options);
-    } else {
-      if (!this.isLoading.get(url)) {
-        this.isLoading.set(url, true);
-        fetch(url)
-          .then((res) => {
-            if (!res.ok) throw new Error(`HTTP status ${res.status}`);
-            return res.arrayBuffer();
-          })
-          .then((data) => this.audioCtx!.decodeAudioData(data))
-          .then((decodedBuf) => {
-            this.sampleCache.set(url, decodedBuf);
-            this.isLoading.set(url, false);
-            // Play it once loaded since it was a playback request
-            this.playBuffer(decodedBuf, out, this.audioCtx!.currentTime, options);
-          })
-          .catch((err) => {
-            console.error("Failed to load sample", url, err);
-            this.isLoading.set(url, false);
-            // Dynamic Synth Fallback block
-            const lowerUrl = url.toLowerCase();
-            if (lowerUrl.includes("kick")) this.playKick(time, out);
-            else if (lowerUrl.includes("snare") || lowerUrl.includes("rim")) this.playSnare(time, out);
-            else if (lowerUrl.includes("hihat") || lowerUrl.includes("hat") || lowerUrl.includes("shaker")) this.playHihat(time, out);
-            else if (lowerUrl.includes("clap")) this.playClap(time, out);
-            else {
-              const matches = url.match(/([A-G]#?[0-9])/i);
-              const freq = matches ? this.noteToFreq(matches[1]) : 440;
-              this.playSynth(time, freq, 0.35, "sine", out);
-            }
-          });
-      }
-    }
+  /**
+   * Facade lookups for Note to MIDI index tables.
+   */
+  noteToMidi(note: string): number {
+    return DSPEngine.noteToMidi(note);
   }
 
-  private playBuffer(buffer: AudioBuffer, out: AudioNode, time: number, options?: { pitch?: number; start?: number; end?: number; fade?: number; startSeconds?: number; durationSeconds?: number; playbackRate?: number }) {
+  /**
+   * Performs real-time playback updates on an AudioBuffer source element.
+   */
+  private playBuffer(
+    buffer: AudioBuffer,
+    out: AudioNode,
+    time: number,
+    options?: { pitch?: number; start?: number; end?: number; fade?: number; startSeconds?: number; durationSeconds?: number; playbackRate?: number }
+  ) {
     if (!this.audioCtx) return;
     const source = this.audioCtx.createBufferSource();
     source.buffer = buffer;
@@ -923,38 +423,89 @@ export class AudioEngineService {
     const end = options?.end !== undefined ? options.end * buffer.duration : buffer.duration;
     const duration = options?.durationSeconds !== undefined ? options.durationSeconds : end - startOffset;
 
-    if (duration > 0 && options?.durationSeconds !== undefined) {
-        source.start(time, startOffset, duration);
-    } else if (duration > 0) {
-        source.start(time, startOffset, duration);
+    if (duration > 0) {
+      source.start(time, startOffset, duration);
     } else {
-        source.start(time, startOffset);
+      source.start(time, startOffset);
     }
   }
 
-  private scheduleNote(
-    sixteenthNoteNumber: number,
+  /**
+   * Helper play dispatcher. Fetches missing buffers dynamically on-play.
+   */
+  private playUrl(
+    originalUrl: string,
+    out: AudioNode,
     time: number,
+    options?: { pitch?: number; start?: number; end?: number; fade?: number; startSeconds?: number; durationSeconds?: number; playbackRate?: number }
   ) {
-    // Schedule MIDI and Virtual Instrument Rack events with sample accuracy!
-    const synthNodes = this.trackNodes.get("t4"); // Virtual synth track
-    const drumNodes = this.trackNodes.get("t1"); // Drum track
-    this.midiScheduler.scheduleMidiClips(sixteenthNoteNumber, time, this.projectService.bpm(), synthNodes?.pannerNode, drumNodes?.pannerNode);
+    if (!this.audioCtx) return;
+    const url = DSPEngine.cleanAudioUrl(originalUrl);
+    const buffer = this.sampleCache.getDirect(url);
+    if (buffer) {
+      this.playBuffer(buffer, out, time, options);
+    } else {
+      if (!this.sampleCache.isLoading(url)) {
+        this.sampleCache.setLoading(url, true);
+        fetch(url)
+          .then((res) => {
+            if (!res.ok) throw new Error(`HTTP status ${res.status}`);
+            return res.arrayBuffer();
+          })
+          .then((data) => this.audioCtx!.decodeAudioData(data))
+          .then((decodedBuf) => {
+            this.sampleCache.saveDirect(url, decodedBuf);
+            this.sampleCache.setLoading(url, false);
+            this.playBuffer(decodedBuf, out, this.audioCtx!.currentTime, options);
+          })
+          .catch((err) => {
+            console.error("Failed to fetch sample in playUrl:", url, err);
+            this.sampleCache.setLoading(url, false);
+            
+            // Dynamic Synth Fallback block in case of network cuts
+            const lowerUrl = url.toLowerCase();
+            if (lowerUrl.includes("kick")) this.playKick(time, out);
+            else if (lowerUrl.includes("snare") || lowerUrl.includes("rim")) this.playSnare(time, out);
+            else if (lowerUrl.includes("hihat") || lowerUrl.includes("hat") || lowerUrl.includes("shaker")) this.playHihat(time, out);
+            else if (lowerUrl.includes("clap")) this.playClap(time, out);
+            else {
+              const matches = url.match(/([A-G]#?[0-9])/i);
+              const freq = matches ? DSPEngine.noteToFreq(matches[1]) : 440;
+              this.playSynth(time, freq, 0.35, "sine", out);
+            }
+          });
+      }
+    }
+  }
+
+  /**
+   * Schedules note events onto MIDI clips and synth rows synchronized of timing lookahead frames.
+   */
+  private scheduleNote(sixteenthNoteNumber: number, time: number) {
+    const synthNodes = this.mixerEngine.trackNodes.get("t4"); // Keyboard synth channel
+    const drumNodes = this.mixerEngine.trackNodes.get("t1");  // Drum sampler channel
+    
+    // Delegate clip scheduling
+    this.midiScheduler.scheduleMidiClips(
+      sixteenthNoteNumber,
+      time,
+      this.projectService.bpm(),
+      synthNodes?.pannerNode,
+      drumNodes?.pannerNode
+    );
 
     const tracks = this.projectService.tracks();
     const mode = this.workspace.playbackMode();
 
-    if (mode === 'timeline') {
-      // TIMELINE ENGINE: Independent Arrangement Player Route
+    if (mode === "timeline") {
       const windowStart = sixteenthNoteNumber * 0.25;
       const windowEnd = windowStart + 0.25;
       const secondsPerBeat = 60.0 / this.projectService.bpm();
 
       for (const track of tracks) {
-        const nodes = this.trackNodes.get(track.id);
+        const nodes = this.mixerEngine.trackNodes.get(track.id);
         if (!nodes) continue;
 
-        // Find clips that start within this 16th note window
         for (const clip of track.clips) {
           if (clip.start >= windowStart && clip.start < windowEnd) {
             const offsetBeats = clip.start - windowStart;
@@ -963,8 +514,7 @@ export class AudioEngineService {
           }
         }
       }
-    } else if (mode === 'sequence') {
-      // SEQUENCER ENGINE: Pattern Sequencer Drum Machine Route
+    } else if (mode === "sequence") {
       const stepIndex = sixteenthNoteNumber % 16;
       const sequence = this.projectService.sequence();
       for (const row of sequence) {
@@ -973,7 +523,7 @@ export class AudioEngineService {
         }
       }
 
-      // PIANO ROLL MIDI Route
+      // Roll patterns triggering
       const pianoStep = sixteenthNoteNumber % 16;
       const pianoNotes = this.workspace.pianoNotes();
       const keys = ["C4", "B3", "A#3", "A3", "G#3", "G3", "F#3", "F3", "E3", "D#3", "D3", "C#3", "C3"];
@@ -988,8 +538,7 @@ export class AudioEngineService {
           }
         }
       }
-    } else if (mode === 'clip') {
-      // CLIP PREVIEW Route: Loop selected vocal/sampler clip
+    } else if (mode === "clip") {
       const stepIndex = sixteenthNoteNumber % 16;
       if (stepIndex === 0) {
         const active = this.workspace.activeSample();
@@ -1000,6 +549,9 @@ export class AudioEngineService {
     }
   }
 
+  /**
+   * Helper dispatch mapping arrangement clips onto specific output chains.
+   */
   private playClip(clip: Clip, time: number, out: AudioNode) {
     const options: { pitch?: number; start?: number; end?: number; fade?: number; startSeconds?: number; durationSeconds?: number; playbackRate?: number } = {};
     const secondsPerBeat = 60.0 / this.projectService.bpm();
@@ -1014,37 +566,22 @@ export class AudioEngineService {
       options.playbackRate = 1.0 / clip.stretchRatio;
     }
 
-    // Check if there is an offline imported/recorded sample with a matching clip name
     const customUrl = this.customAssetUrlMap.get(clip.name);
     if (customUrl) {
       this.playUrl(customUrl, out, time, options);
       return;
     }
 
-    // A helper to dispatch clip playback correctly.
-    // In a full implementation we'd grab the URL for the sample from a database.
-    // Here we map clip names to the playOneShot implementation over to the designated 'out' node.
-
-    // Quick mapping for github/tonejs sample URLs we added to the browser
     const urlMap: Record<string, string> = {
-      "Wes Kick":
-        "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/kick.wav",
-      "Wes Snare":
-        "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/snare.wav",
-      "Wes Clap":
-        "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/clap.wav",
-      "Wes Tom":
-        "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tom.wav",
-      "Wes Boom":
-        "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/boom.wav",
-      "Wes HiHat":
-        "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/hihat.wav",
-      "Wes OpenHat":
-        "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/openhat.wav",
-      "Wes Ride":
-        "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/ride.wav",
-      "Wes Tink":
-        "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tink.wav",
+      "Wes Kick": "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/kick.wav",
+      "Wes Snare": "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/snare.wav",
+      "Wes Clap": "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/clap.wav",
+      "Wes Tom": "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tom.wav",
+      "Wes Boom": "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/boom.wav",
+      "Wes HiHat": "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/hihat.wav",
+      "Wes OpenHat": "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/openhat.wav",
+      "Wes Ride": "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/ride.wav",
+      "Wes Tink": "https://raw.githubusercontent.com/wesbos/JavaScript30/master/01%20-%20JavaScript%20Drum%20Kit/sounds/tink.wav",
       "Tone Kick": "https://tonejs.github.io/audio/drum-samples/kick.mp3",
       "Tone Snare": "https://tonejs.github.io/audio/drum-samples/snare.mp3",
       "Tone Tom 1": "https://tonejs.github.io/audio/drum-samples/tom1.mp3",
@@ -1096,7 +633,7 @@ export class AudioEngineService {
     if (urlMap[clip.name]) {
       this.playUrl(urlMap[clip.name], out, time, options);
     } else {
-      // Fallback to internal synth engine
+      // Inline fallbacks
       switch (clip.name.toLowerCase()) {
         case "kick":
         case "808 kick 01":
@@ -1128,20 +665,17 @@ export class AudioEngineService {
           this.playSynth(time, 41.2 * 2, 0.4, "sawtooth", out);
           break;
         default:
-          if (clip.name.toLowerCase().includes("kick"))
-            this.playKick(time, out);
-          else if (clip.name.toLowerCase().includes("snare"))
-            this.playSnare(time, out);
-          else if (clip.name.toLowerCase().includes("hat"))
-            this.playHihat(time, out);
-          else if (clip.name.toLowerCase().includes("bass"))
-            this.playSynth(time, 41.2 * 2, 0.4, "sawtooth", out);
+          if (clip.name.toLowerCase().includes("kick")) this.playKick(time, out);
+          else if (clip.name.toLowerCase().includes("snare")) this.playSnare(time, out);
+          else if (clip.name.toLowerCase().includes("hat")) this.playHihat(time, out);
+          else if (clip.name.toLowerCase().includes("bass")) this.playSynth(time, 41.2 * 2, 0.4, "sawtooth", out);
           else this.playSynth(time, 440, 0.2, "sine", out);
           break;
       }
     }
   }
 
+  // Pure analog synth oscillator voices models
   private playKick(time: number, out: AudioNode) {
     if (!this.audioCtx) return;
     const osc = this.audioCtx.createOscillator();
@@ -1172,7 +706,6 @@ export class AudioEngineService {
 
   private playHihat(time: number, out: AudioNode) {
     if (!this.audioCtx) return;
-    // Simple short burst of high frequency
     const osc = this.audioCtx.createOscillator();
     const gain = this.audioCtx.createGain();
     osc.type = "square";
@@ -1187,7 +720,6 @@ export class AudioEngineService {
 
   private playClap(time: number, out: AudioNode) {
     if (!this.audioCtx) return;
-    // Short burst of noise/square
     const osc = this.audioCtx.createOscillator();
     const gain = this.audioCtx.createGain();
     osc.type = "sawtooth";
@@ -1236,5 +768,58 @@ export class AudioEngineService {
 
     osc.start(time);
     osc.stop(time + duration + release + 0.1);
+  }
+
+  /**
+   * Performs high-fidelity offline bounce rendering of all active sequencer tracks and clips.
+   */
+  public async exportProjectWav(): Promise<Blob> {
+    const BPM = this.projectService.bpm();
+    const secondsPerBeat = 60.0 / BPM;
+    const secondsPerSixteenth = secondsPerBeat / 4.0;
+    
+    const events: OfflineRenderEvent[] = [];
+    
+    // 1. Gather MIDI sequence from active workspace pianoNotes
+    const pianoNotes = this.workspace.pianoNotes();
+    const keys = ["C4", "B3", "A#3", "A3", "G#3", "G3", "F#3", "F3", "E3", "D#3", "D3", "C#3", "C3"];
+    for (const note of pianoNotes) {
+      const stepIndex = Math.round(note.x / 32);
+      const noteIndex = Math.round(note.y / 24);
+      const pitchName = keys[noteIndex] || "C4";
+      const midiNote = DSPEngine.noteToMidi(pitchName);
+      const startTime = stepIndex * secondsPerSixteenth;
+      events.push({
+        note: midiNote,
+        velocity: 100,
+        startTime: startTime,
+        duration: secondsPerSixteenth,
+        instrumentType: "synth"
+      });
+    }
+
+    // 2. Wrap and loop the 16 drum sequencer rows across the project bounds
+    const sequence = this.projectService.sequence();
+    const maxBeats = 48;
+    const totalSteps = maxBeats * 4;
+    for (let step = 0; step < totalSteps; step++) {
+      const stepIn16 = step % 16;
+      for (let rIdx = 0; rIdx < sequence.length; rIdx++) {
+        const row = sequence[rIdx];
+        if (row.steps[stepIn16]) {
+          const startTime = step * secondsPerSixteenth;
+          events.push({
+            note: rIdx + 1,
+            velocity: 100,
+            startTime: startTime,
+            duration: 0.2,
+            instrumentType: "drum"
+          });
+        }
+      }
+    }
+
+    const totalDurationSeconds = maxBeats * secondsPerBeat;
+    return await this.coreEngine.renderer.renderProject(events, totalDurationSeconds);
   }
 }

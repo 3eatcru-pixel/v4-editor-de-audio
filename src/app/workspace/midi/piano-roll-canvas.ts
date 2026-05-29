@@ -1,5 +1,5 @@
-import { Component, ElementRef, HostListener, inject, OnDestroy, OnInit, ViewChild, effect } from "@angular/core";
-import { CommonModule } from "@angular/common";
+import { Component, ElementRef, HostListener, inject, OnDestroy, OnInit, ViewChild, effect, PLATFORM_ID } from "@angular/core";
+import { CommonModule, isPlatformBrowser } from "@angular/common";
 import { MatIconModule } from "@angular/material/icon";
 import { MidiEngineService } from "../../core/midi/midi-engine.service";
 import { InstrumentRackService } from "../../core/instruments/instrument-rack.service";
@@ -185,6 +185,7 @@ export class PianoRollCanvasComponent implements OnInit, OnDestroy {
   scheduler = inject(MidiSchedulerService);
   project = inject(ProjectService);
   workspace = inject(WorkspaceService);
+  platformId = inject(PLATFORM_ID);
 
   @ViewChild("gridCanvas", { static: true }) gridCanvasRef!: ElementRef<HTMLCanvasElement>;
   @ViewChild("velocityCanvas", { static: true }) velocityCanvasRef!: ElementRef<HTMLCanvasElement>;
@@ -229,6 +230,7 @@ export class PianoRollCanvasComponent implements OnInit, OnDestroy {
 
     // Redraw if notes array or scale locking registers updates
     effect(() => {
+      if (!isPlatformBrowser(this.platformId)) return;
       this.midiEngine.midiClips();
       this.midiEngine.editorScale();
       this.midiEngine.editorKey();
@@ -239,12 +241,14 @@ export class PianoRollCanvasComponent implements OnInit, OnDestroy {
 
     // Sync playhead ticking
     effect(() => {
+      if (!isPlatformBrowser(this.platformId)) return;
       this.project.playheadPosition();
       this.requestDraw();
     });
   }
 
   ngOnInit() {
+    if (!isPlatformBrowser(this.platformId)) return;
     this.resizeCanvases();
     this.startDrawLoop();
 
@@ -676,6 +680,7 @@ export class PianoRollCanvasComponent implements OnInit, OnDestroy {
 
   // --- Rendering engine tick loop (Canvas-Optimized virtual render) ---
   private requestDraw() {
+    if (!isPlatformBrowser(this.platformId)) return;
     this.draw();
   }
 

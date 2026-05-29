@@ -6,6 +6,7 @@ import { WorkspaceService } from '../core/workspace.service';
 import { HistoryService } from '../core/history.service';
 import { MidiEngineService } from '../core/midi/midi-engine.service';
 import { MidiNote } from '../core/midi/midi-types';
+import { AudioEngineService } from '../core/audio-engine.service';
 
 @Component({
   selector: 'app-top-bar',
@@ -589,6 +590,7 @@ export class TopBarComponent {
   project = inject(ProjectService);
   workspace = inject(WorkspaceService);
   history = inject(HistoryService);
+  audio = inject(AudioEngineService);
 
   constructor() {
     effect(() => {
@@ -990,55 +992,44 @@ export class TopBarComponent {
     this.activeMenu = null;
   }
 
-  triggerExport() {
+  async triggerExport() {
     this.activeModal = 'export';
-    this.exportProgress = 0;
+    this.exportProgress = 20;
     this.activeMenu = null;
     
-    if (this.exportInterval) clearInterval(this.exportInterval);
-    this.exportInterval = setInterval(() => {
-      this.exportProgress += 5;
-      if (this.exportProgress >= 100) {
-        if (this.exportInterval) {
-          clearInterval(this.exportInterval);
-          this.exportInterval = null;
+    try {
+      this.exportProgress = 45;
+      const wavBlob = await this.audio.exportProjectWav();
+      this.exportProgress = 85;
+      
+      this.exportProgress = 100;
+      setTimeout(() => {
+        this.activeModal = null;
+        this.showToast('Mixdown Export Complete', 'A high-fidelity stereo WAV file has been rendered and queued for download.');
+        
+        try {
+          const url = URL.createObjectURL(wavBlob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = `Sonos_Mixdown_Bounce_${Math.floor(Date.now() / 1000)}.wav`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        } catch (ex) {
+          console.warn("Blob download navigation block averted:", ex);
         }
-        setTimeout(() => {
-          this.activeModal = null;
-          this.showToast('Mixdown Export Complete', 'A high-fidelity stereo WAV file has been rendered and queued for download.');
-          this.downloadWavFile();
-        }, 300);
-      }
-    }, 80);
+      }, 600);
+    } catch (e) {
+      console.error("Offline bounce render error:", e);
+      this.exportProgress = 0;
+      this.activeModal = null;
+      this.showToast('Export Failed', 'An error occurred during high-fidelity bounce rendering.');
+    }
   }
 
   downloadWavFile() {
-    try {
-      const header = new Uint8Array([
-        0x52, 0x49, 0x46, 0x46, // "RIFF"
-        0x24, 0x08, 0x00, 0x00, // file size placeholder
-        0x57, 0x41, 0x56, 0x41, // "WAVE"
-        0x66, 0x6d, 0x74, 0x20, // "fmt "
-        0x10, 0x00, 0x00, 0x00, // chunk size 16
-        0x01, 0x00, 0x02, 0x00, // stereo PCM
-        0x80, 0xbb, 0x01, 0x00, // 48000 Hz
-        0x00, 0xee, 0x02, 0x00, // byte rate
-        0x04, 0x00, 0x10, 0x00, // block align & bits per sample
-        0x64, 0x61, 0x74, 0x61, // "data"
-        0x00, 0x08, 0x00, 0x00  // subchunk size
-      ]);
-      const blob = new Blob([header], { type: 'audio/wav' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `Sonos_Mixdown_Bounce_${Math.floor(Date.now() / 1000)}.wav`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    } catch {
-      // Ignore download block errors gracefully
-    }
+    // Deprecated in favor of direct state integration inside triggerExport()
   }
 
   // --- Edit Actions ---

@@ -352,57 +352,23 @@ export class AssetLibraryService {
   async startMicRecording() {
     if (!isPlatformBrowser(this.platformId)) return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      this.recordingChunks = [];
-      
-      const formats = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg", "audio/mp4", "audio/wav"];
-      let selectedFormat = "audio/webm";
-      for (const format of formats) {
-        if (MediaRecorder.isTypeSupported(format)) {
-          selectedFormat = format;
-          break;
-        }
+      if (!this.audio.audioCtx) {
+        const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        this.audio.audioCtx = new AudioCtx();
+      }
+      if (this.audio.audioCtx.state === "suspended") {
+        await this.audio.audioCtx.resume();
       }
 
-      this.mediaRecorder = new MediaRecorder(stream, { mimeType: selectedFormat });
-      
-      this.mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          this.recordingChunks.push(e.data);
-        }
-      };
+      const hasAccess = await this.audio.coreEngine.recorder.requestAccess();
+      if (!hasAccess) {
+        throw new Error("Microphone access denied");
+      }
 
-      this.mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(this.recordingChunks, { type: selectedFormat });
-        const assetId = "rec_" + Date.now();
-        
-        // Save the audio blob locally
-        await this.saveAssetBlobToIDB(assetId, audioBlob);
-        
-        const localUrl = URL.createObjectURL(audioBlob);
-        const asset: OfflineAsset = {
-          id: assetId,
-          name: `Mic Recording #${this.savedAssets().filter(a => a.category === 'recorded').length + 1}`,
-          category: "recorded",
-          createdAt: new Date().toISOString(),
-          format: selectedFormat,
-          blobUrl: localUrl
-        };
-
-        const updated = [asset, ...this.savedAssets()];
-        this.savedAssets.set(updated);
-        localStorage.setItem("workspace_saved_assets", JSON.stringify(updated));
-
-        // Warm up sound cache
-        this.audio.getAudioBuffer(localUrl).catch((ex) => console.warn("Warm up cache failed:", ex));
-        
-        // Turn off stream
-        stream.getTracks().forEach((t) => t.stop());
-      };
+      this.audio.coreEngine.recorder.start(this.audio.audioCtx);
 
       this.recordingDuration.set(0);
       this.isRecording.set(true);
-      this.mediaRecorder.start(250); // timeslices of 250ms
 
       if (this.recordingInterval) clearInterval(this.recordingInterval);
       this.recordingInterval = setInterval(() => {
@@ -417,13 +383,32 @@ export class AssetLibraryService {
   }
 
   stopMicRecording() {
-    if (this.mediaRecorder && this.mediaRecorder.state !== "inactive") {
-      this.mediaRecorder.stop();
-    }
     this.isRecording.set(false);
     if (this.recordingInterval) {
       clearInterval(this.recordingInterval);
       this.recordingInterval = null;
+    }
+
+    const audioBlob = this.audio.coreEngine.recorder.stop();
+    if (audioBlob) {
+      const assetId = "rec_" + Date.now();
+      this.saveAssetBlobToIDB(assetId, audioBlob).then(() => {
+        const localUrl = URL.createObjectURL(audioBlob);
+        const asset: OfflineAsset = {
+          id: assetId,
+          name: `Mic Recording #${this.savedAssets().filter(a => a.category === 'recorded').length + 1}`,
+          category: "recorded",
+          createdAt: new Date().toISOString(),
+          format: "audio/wav",
+          blobUrl: localUrl
+        };
+        const updated = [asset, ...this.savedAssets()];
+        this.savedAssets.set(updated);
+        localStorage.setItem("workspace_saved_assets", JSON.stringify(updated));
+
+        // Warm up sound cache
+        this.audio.getAudioBuffer(localUrl).catch((ex) => console.warn("Warm up cache failed:", ex));
+      });
     }
   }
 

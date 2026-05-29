@@ -710,6 +710,12 @@ export class TimelineCanvasComponent implements AfterViewInit, OnDestroy {
       track.clips.forEach((clip) => {
         const cx = clip.start * zoomX;
         const cw = clip.duration * zoomX;
+
+        // Viewport region culling (only render visible clips)
+        if (cx + cw < scrollX || cx > scrollX + width) {
+          return;
+        }
+
         const cy = y + 4;
         const ch = this.TRACK_HEIGHT - 8;
 

@@ -8,8 +8,9 @@ import {
   HostListener,
   ViewChild,
   ElementRef,
+  PLATFORM_ID,
 } from "@angular/core";
-import { CommonModule } from "@angular/common";
+import { CommonModule, isPlatformBrowser } from "@angular/common";
 import { MatIconModule } from "@angular/material/icon";
 import { ProjectService, Track } from "../core/project.service";
 import { AudioEngineService } from "../core/audio-engine.service";
@@ -1488,6 +1489,7 @@ export class BottomPanelComponent implements OnDestroy {
   workspace = inject(WorkspaceService);
   history = inject(HistoryService);
   pluginHost = inject(PluginHostService);
+  platformId = inject(PLATFORM_ID);
   Math = Math;
 
   get selectedTrack(): Track | undefined {
@@ -2369,6 +2371,7 @@ export class BottomPanelComponent implements OnDestroy {
 
   constructor() {
     effect(() => {
+      if (!isPlatformBrowser(this.platformId)) return;
       if (this.project.isPlaying()) {
         this.animateVU();
       } else {
@@ -2383,6 +2386,7 @@ export class BottomPanelComponent implements OnDestroy {
     });
 
     effect(() => {
+      if (!isPlatformBrowser(this.platformId)) return;
       const tab = this.activeTab();
       const sample = this.workspace.activeSample();
       if (tab === "editor" && sample?.url) {
@@ -2398,6 +2402,7 @@ export class BottomPanelComponent implements OnDestroy {
   }
 
   drawWaveform(buffer: AudioBuffer) {
+    if (!isPlatformBrowser(this.platformId)) return;
     if (!this.canvasRef) return;
     const canvas = this.canvasRef.nativeElement;
     const ctx = canvas.getContext("2d");
@@ -2432,6 +2437,7 @@ export class BottomPanelComponent implements OnDestroy {
   }
 
   clearWaveform() {
+    if (!isPlatformBrowser(this.platformId)) return;
     if (!this.canvasRef) return;
     const canvas = this.canvasRef.nativeElement;
     const ctx = canvas.getContext("2d");

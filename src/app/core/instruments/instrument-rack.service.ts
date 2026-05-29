@@ -94,7 +94,15 @@ export class InstrumentRackService {
     if (this.audioCtx && this.audioCtx.state === "suspended") {
       this.audioCtx.resume();
     }
-    return this.audioCtx || new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+    if (this.audioCtx) {
+      return this.audioCtx;
+    }
+    if (isPlatformBrowser(this.platformId)) {
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      return new AudioCtx();
+    }
+    // Return dummy or empty object mock if server-side (prevent crashes)
+    return {} as unknown as AudioContext;
   }
 
   midiToFreq(midiNote: number): number {
