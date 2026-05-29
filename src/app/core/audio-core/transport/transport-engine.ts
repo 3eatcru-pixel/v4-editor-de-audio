@@ -1,3 +1,5 @@
+import { eventBus } from "../events/event-bus";
+
 /**
  * Professional decoupled TransportEngine (Phase 1).
  * Pure-TypeScript core timed sequencer coordinator with zero framework overhead.
@@ -43,6 +45,7 @@ export class TransportEngine {
     this.currentTick = Math.floor(this.playheadPosition * this.PPQ);
     this.nextEventTime = this.config.getAudioContextTime() + 0.05;
     this.config.onPlayheadChange(this.playheadPosition);
+    eventBus.publishPlayheadChange({ playhead: this.playheadPosition });
   }
 
   /**
@@ -57,6 +60,7 @@ export class TransportEngine {
     if (this.clockWorker) {
       this.clockWorker.postMessage("start");
     }
+    eventBus.publishPlay();
   }
 
   /**
@@ -66,6 +70,7 @@ export class TransportEngine {
     if (this.clockWorker) {
       this.clockWorker.postMessage("stop");
     }
+    eventBus.publishPause();
   }
 
   /**
@@ -74,6 +79,7 @@ export class TransportEngine {
   public stop() {
     this.pause();
     this.seek(0);
+    eventBus.publishStop();
   }
 
   /**
@@ -133,6 +139,7 @@ export class TransportEngine {
 
     this.playheadPosition = nextBeats;
     this.config.onPlayheadChange(this.playheadPosition);
+    eventBus.publishPlayheadChange({ playhead: this.playheadPosition });
 
     // Precise scheduling lookup window (100ms look-ahead fader)
     const ctxTime = this.config.getAudioContextTime();
@@ -142,6 +149,7 @@ export class TransportEngine {
     while (this.nextEventTime < ctxTime + 0.12) {
       // Fire scheduler event
       this.config.onTick(this.currentTick, this.nextEventTime);
+      eventBus.publishTick({ absoluteTicks: this.currentTick, preciseTime: this.nextEventTime });
 
       // Increment ticks count (equivalent to a custom PPQ tick rate step)
       // Standard lookahead scheduling increments by sixteenth notes (240 ticks) for efficiency

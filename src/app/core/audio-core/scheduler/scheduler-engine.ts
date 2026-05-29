@@ -1,4 +1,6 @@
 import { MidiNote, MIDI_PPQ } from "../../midi/midi-types";
+import { Subscription } from "rxjs";
+import { eventBus } from "../events/event-bus";
 
 export interface SchedulerCallback {
   triggerSynth: (midiNote: number, velocity: number, startTime: number, duration: number) => void;
@@ -8,6 +10,7 @@ export interface SchedulerCallback {
 export class SchedulerEngine {
   private lastScheduledTick = -1;
   private arpIndex = 0;
+  private subscription: Subscription | null = null;
 
   constructor(private callbacks: SchedulerCallback) {}
 
@@ -102,5 +105,45 @@ export class SchedulerEngine {
     }
 
     this.callbacks.triggerSynth(noteToPlay, 100, time, 0.15);
+  }
+
+  /**
+   * Starts listening to EventBus transport ticks to trigger scheduling cycle automatically and decouple caller.
+   */
+  public startListening(config: {
+    getBpm: () => number;
+    getActiveNotes: () => MidiNote[];
+    getHeldKeys: () => number[];
+    getArpEnabled: () => boolean;
+    getArpDivision: () => "1/8" | "1/16" | "1/32";
+    getArpPattern: () => "up" | "down" | "random";
+    getNoteRepeatEnabled: () => boolean;
+    getNoteRepeatDivision: () => "1/8" | "1/16" | "1/32";
+  }) {
+    this.stopListening();
+    this.subscription = eventBus.onTick$().subscribe(({ absoluteTicks, preciseTime }) => {
+      this.schedule(
+        absoluteTicks,
+        preciseTime,
+        config.getBpm(),
+        config.getActiveNotes(),
+        config.getHeldKeys(),
+        config.getArpEnabled(),
+        config.getArpDivision(),
+        config.getArpPattern(),
+        config.getNoteRepeatEnabled(),
+        config.getNoteRepeatDivision()
+      );
+    });
+  }
+
+  /**
+   * Safe teardown of event stream listener.
+   */
+  public stopListening() {
+    if (this.subscription) {
+      this.subscription.unsubscribe();
+      this.subscription = null;
+    }
   }
 }

@@ -6,11 +6,11 @@ import { MidiSchedulerService } from "./midi/midi-scheduler.service";
 import { PluginHostService } from "./plugins/plugin-host.service";
 
 // Core Audio sub-engine modules representing the V5 architecture
-import { DSPEngine } from "./audio/dsp-engine";
-import { SampleCache } from "./audio/sample-cache";
-import { MixerEngine } from "./audio/mixer-engine";
-import { TransportEngine } from "./audio/transport-engine";
-import { AudioCoreEngine } from "./audio/audio-core-engine";
+import { DSPEngine } from "./legacy-audio/dsp-engine";
+import { SampleCache } from "./legacy-audio/sample-cache";
+import { MixerEngine } from "./legacy-audio/mixer-engine";
+import { TransportEngine } from "./legacy-audio/transport-engine";
+import { AudioCoreEngine } from "./legacy-audio/audio-core-engine";
 import { OfflineRenderEvent } from "./audio-core/export/offline-renderer";
 
 @Injectable({ providedIn: "root" })
