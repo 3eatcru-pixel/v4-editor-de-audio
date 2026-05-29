@@ -1,0 +1,10 @@
+{
+  "name": "v4 editor de audio e midi pro",
+  "description": "um editor de audio e midi pro com varias ferramentas e off line, e muito mais  ",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
